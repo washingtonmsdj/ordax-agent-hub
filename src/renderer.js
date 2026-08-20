@@ -5,32 +5,19 @@ let activeAgent;
 const webviews = new Map();
 const inactiveSince = new Map();
 let suspensionTimer;
+let updateUrl = '';
 
 function slug(value) {
-  return value
-    .toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || `agent-${Date.now()}`;
+  return value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || `agent-${Date.now()}`;
 }
-
-function partitionFor(agent) {
-  return `persist:ordax-agent-${agent.profileId}`;
-}
-
+function partitionFor(agent) { return `persist:ordax-agent-${agent.profileId}`; }
+function findAgent(id) { return state.agents.find((agent) => agent.id === id); }
+async function persist() { await window.agentHub.setState(state); }
 function normalizeUrl(value) {
   const trimmed = value.trim();
   if (!trimmed) return 'https://chatgpt.com/';
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-  return `https://${trimmed}`;
-}
-
-async function persist() {
-  await window.agentHub.setState(state);
-}
-
-function findAgent(id) {
-  return state.agents.find((agent) => agent.id === id);
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 function renderTabs() {
@@ -39,9 +26,10 @@ function renderTabs() {
   for (const agent of state.agents) {
     const el = document.createElement('div');
     el.className = `tab ${agent.id === state.activeAgentId ? 'active' : ''}`;
-    el.innerHTML = `<div class="tab-title"></div><div class="tab-account muted"></div>`;
+    el.innerHTML = '<div class="tab-title"></div><div class="tab-account muted"></div><div class="tab-branch mono muted"></div>';
     el.querySelector('.tab-title').textContent = agent.name;
     el.querySelector('.tab-account').textContent = agent.accountLabel || 'sem identificação';
+    el.querySelector('.tab-branch').textContent = agent.expectedBranch || 'sem branch esperada';
     el.addEventListener('click', () => activateAgent(agent.id));
     tabs.appendChild(el);
   }
@@ -58,29 +46,18 @@ function attachWebviewEvents(agent, view) {
       }
     } catch {}
   };
-
-  view.addEventListener('did-start-loading', () => {
-    if (agent.id === state.activeAgentId) $('webStatus').textContent = 'carregando';
-  });
-  view.addEventListener('did-stop-loading', () => {
-    if (agent.id === state.activeAgentId) $('webStatus').textContent = 'pronto';
-    saveUrl();
-  });
+  view.addEventListener('did-start-loading', () => { if (agent.id === state.activeAgentId) $('webStatus').textContent = 'carregando'; });
+  view.addEventListener('did-stop-loading', () => { if (agent.id === state.activeAgentId) $('webStatus').textContent = 'pronto'; saveUrl(); });
   view.addEventListener('did-navigate', saveUrl);
   view.addEventListener('did-navigate-in-page', saveUrl);
-  view.addEventListener('page-title-updated', (event) => {
-    if (event.title && event.title !== 'ChatGPT') view.dataset.pageTitle = event.title;
-  });
   view.addEventListener('did-fail-load', (event) => {
-    if (event.errorCode === -3) return;
-    if (agent.id === state.activeAgentId) $('webStatus').textContent = 'erro';
+    if (event.errorCode !== -3 && agent.id === state.activeAgentId) $('webStatus').textContent = 'erro';
   });
 }
 
 function ensureWebview(agent) {
   let view = webviews.get(agent.id);
   if (view && view.isConnected) return view;
-
   view = document.createElement('webview');
   view.className = 'agent-webview';
   view.setAttribute('partition', partitionFor(agent));
@@ -105,6 +82,17 @@ function unloadWebview(agentId) {
   persist();
 }
 
+async function refreshGit() {
+  if (!activeAgent) return;
+  const id = activeAgent.id;
+  return window.agentWorkspace.refresh({
+    state,
+    agent: activeAgent,
+    persist,
+    isActive: () => state.activeAgentId === id
+  });
+}
+
 async function activateAgent(id) {
   if (state.activeAgentId && state.activeAgentId !== id) inactiveSince.set(state.activeAgentId, Date.now());
   state.activeAgentId = id;
@@ -113,11 +101,9 @@ async function activateAgent(id) {
   await persist();
   renderTabs();
   renderAgentPanel();
-
   const host = $('webviewHost');
   host.innerHTML = '';
-  const view = ensureWebview(activeAgent);
-  host.appendChild(view);
+  host.appendChild(ensureWebview(activeAgent));
   $('urlBox').value = activeAgent.lastUrl || 'https://chatgpt.com/';
   refreshGit();
 }
@@ -133,46 +119,7 @@ function renderAgentPanel() {
   $('suspendMinutesLabel').textContent = state.suspendAfterMinutes;
 }
 
-async function refreshGit() {
-  if (!activeAgent) return;
-  $('gitBranch').textContent = '...';
-  $('gitHead').textContent = '...';
-  $('gitStatus').textContent = '...';
-  $('gitChanges').textContent = '...';
-  $('branchWarning').classList.add('hidden');
-
-  if (!activeAgent.repoPath) {
-    $('gitBranch').textContent = '—';
-    $('gitHead').textContent = '—';
-    $('gitStatus').textContent = 'sem repo';
-    $('gitChanges').textContent = 'Selecione o clone local.';
-    return;
-  }
-
-  const info = await window.agentHub.gitInfo(activeAgent.repoPath);
-  if (!info.ok) {
-    $('gitBranch').textContent = 'erro';
-    $('gitHead').textContent = '—';
-    $('gitStatus').textContent = 'inválido';
-    $('gitChanges').textContent = info.error;
-    return;
-  }
-
-  $('gitBranch').textContent = info.branch;
-  $('gitHead').textContent = info.head;
-  $('gitStatus').textContent = info.clean ? 'limpo' : `${info.changes.length} mudança(s)`;
-  $('gitChanges').textContent = info.clean ? 'Working tree limpo.' : info.changes.join('\n');
-
-  if (activeAgent.expectedBranch && info.branch !== activeAgent.expectedBranch) {
-    $('branchWarning').textContent = `Branch atual é ${info.branch}; esta aba espera ${activeAgent.expectedBranch}.`;
-    $('branchWarning').classList.remove('hidden');
-  }
-}
-
-function activeView() {
-  return activeAgent ? webviews.get(activeAgent.id) : null;
-}
-
+function activeView() { return activeAgent ? webviews.get(activeAgent.id) : null; }
 function openAgentModal(agent = null) {
   $('modalBackdrop').classList.remove('hidden');
   $('modalTitle').textContent = agent ? 'Editar agente' : 'Novo agente';
@@ -183,16 +130,12 @@ function openAgentModal(agent = null) {
   $('modalMission').value = agent?.mission || '';
   $('deleteAgentBtn').classList.toggle('hidden', !agent || state.agents.length <= 1);
 }
-
-function closeAgentModal() {
-  $('modalBackdrop').classList.add('hidden');
-}
+function closeAgentModal() { $('modalBackdrop').classList.add('hidden'); }
 
 async function saveAgentFromModal() {
   const existingId = $('modalAgentId').value;
   const name = $('modalName').value.trim();
   if (!name) return alert('Informe um nome para o agente.');
-
   if (existingId) {
     const agent = findAgent(existingId);
     agent.name = name;
@@ -202,19 +145,10 @@ async function saveAgentFromModal() {
   } else {
     let id = slug(name);
     while (findAgent(id)) id = `${id}-${Math.floor(Math.random() * 9999)}`;
-    state.agents.push({
-      id,
-      name,
-      accountLabel: $('modalAccount').value.trim(),
-      expectedBranch: $('modalBranch').value.trim(),
-      mission: $('modalMission').value.trim(),
-      profileId: id,
-      repoPath: '',
-      lastUrl: 'https://chatgpt.com/'
-    });
+    state.agents.push({ id, name, accountLabel: $('modalAccount').value.trim(), expectedBranch: $('modalBranch').value.trim(),
+      mission: $('modalMission').value.trim(), profileId: id, repoPath: '', lastUrl: 'https://chatgpt.com/' });
     state.activeAgentId = id;
   }
-
   await persist();
   closeAgentModal();
   await activateAgent(state.activeAgentId);
@@ -224,33 +158,34 @@ async function deleteActiveAgentFromModal() {
   const id = $('modalAgentId').value;
   if (!id || state.agents.length <= 1) return;
   const agent = findAgent(id);
-  if (!confirm(`Excluir a aba "${agent.name}"? A pasta de sessão do Electron permanece no perfil local do aplicativo.`)) return;
+  if (!confirm(`Excluir a aba "${agent.name}"? A sessão persistente permanece no perfil local do aplicativo.`)) return;
   unloadWebview(id);
   state.agents = state.agents.filter((item) => item.id !== id);
   if (state.activeAgentId === id) state.activeAgentId = state.agents[0].id;
-  await persist();
-  closeAgentModal();
-  await activateAgent(state.activeAgentId);
+  await persist(); closeAgentModal(); await activateAgent(state.activeAgentId);
 }
 
-async function copyContext() {
-  if (!activeAgent) return;
-  const info = activeAgent.repoPath ? await window.agentHub.gitInfo(activeAgent.repoPath) : null;
-  const text = [
-    `AGENT=${activeAgent.name}`,
-    `ACCOUNT=${activeAgent.accountLabel || ''}`,
-    `REPO_PATH=${activeAgent.repoPath || ''}`,
-    `EXPECTED_BRANCH=${activeAgent.expectedBranch || ''}`,
-    `CURRENT_BRANCH=${info?.ok ? info.branch : ''}`,
-    `HEAD_SHA=${info?.ok ? info.head : ''}`,
-    `LOCAL_CHANGES=${info?.ok ? info.changes.length : ''}`,
-    '',
-    'MISSION:',
-    activeAgent.mission || ''
-  ].join('\n');
-  await navigator.clipboard.writeText(text);
-  $('saveStateLabel').textContent = 'contexto copiado';
-  setTimeout(() => $('saveStateLabel').textContent = '', 1500);
+async function checkUpdates({ silent = false } = {}) {
+  $('updateStatus').textContent = 'verificando...';
+  const result = await window.agentHub.checkUpdates();
+  if (!result.ok) {
+    $('updateStatus').textContent = 'falha ao verificar';
+    if (!silent) alert(`Não foi possível verificar atualizações:\n${result.error}`);
+    return;
+  }
+  if (result.hasUpdate) {
+    updateUrl = result.url || '';
+    $('updateStatus').textContent = `nova ${result.latestVersion}`;
+    $('checkUpdateBtn').classList.add('update-available');
+    $('checkUpdateBtn').textContent = `Atualizar → ${result.latestVersion}`;
+    if (!silent && confirm(`Nova versão ${result.latestVersion} disponível.\n\nAbrir a Release para baixar o instalador?`)) window.agentHub.openExternal(updateUrl);
+    return;
+  }
+  updateUrl = '';
+  $('updateStatus').textContent = 'atualizado';
+  $('checkUpdateBtn').classList.remove('update-available');
+  $('checkUpdateBtn').textContent = 'Atualizações';
+  if (!silent) alert(`Você está na versão mais recente disponível (${result.currentVersion}).`);
 }
 
 function startSuspensionLoop() {
@@ -259,8 +194,7 @@ function startSuspensionLoop() {
     const threshold = Math.max(1, Number(state.suspendAfterMinutes) || 10) * 60_000;
     for (const [id, since] of inactiveSince.entries()) {
       if (id !== state.activeAgentId && Date.now() - since >= threshold) {
-        unloadWebview(id);
-        inactiveSince.delete(id);
+        unloadWebview(id); inactiveSince.delete(id);
       }
     }
   }, 30_000);
@@ -272,56 +206,49 @@ function bindUi() {
   $('cancelModalBtn').addEventListener('click', closeAgentModal);
   $('saveAgentBtn').addEventListener('click', saveAgentFromModal);
   $('deleteAgentBtn').addEventListener('click', deleteActiveAgentFromModal);
-
   $('pickRepoBtn').addEventListener('click', async () => {
-    const path = await window.agentHub.pickRepo();
-    if (!path) return;
-    activeAgent.repoPath = path;
-    await persist();
-    renderAgentPanel();
-    refreshGit();
+    const result = await window.agentHub.pickRepo();
+    if (!result?.ok) return;
+    activeAgent.repoPath = result.path;
+    await persist(); renderAgentPanel(); await refreshGit();
+    if (result.normalizedFrom) window.agentWorkspace.notice(`Você selecionou uma subpasta (${result.normalizedFrom}). O Agent Hub salvou a raiz Git correta: ${result.path}`, 'info');
   });
-
   $('refreshGitBtn').addEventListener('click', refreshGit);
   $('refreshAllBtn').addEventListener('click', refreshGit);
   $('openFolderBtn').addEventListener('click', () => window.agentHub.openFolder(activeAgent.repoPath));
-  $('copyContextBtn').addEventListener('click', copyContext);
-
+  $('openRemoteBtn').addEventListener('click', async () => {
+    const result = await window.agentWorkspace.openRemote(activeAgent);
+    if (!result.ok) alert(result.error);
+  });
+  $('copyContextBtn').addEventListener('click', async () => {
+    await window.agentWorkspace.copyContext(activeAgent);
+    $('saveStateLabel').textContent = 'contexto copiado';
+    setTimeout(() => $('saveStateLabel').textContent = '', 1500);
+  });
+  $('checkUpdateBtn').addEventListener('click', () => {
+    if (updateUrl && $('checkUpdateBtn').classList.contains('update-available')) return window.agentHub.openExternal(updateUrl);
+    checkUpdates();
+  });
   $('saveMissionBtn').addEventListener('click', async () => {
-    activeAgent.mission = $('mission').value;
-    await persist();
-    $('saveStateLabel').textContent = 'salvo';
-    setTimeout(() => $('saveStateLabel').textContent = '', 1200);
+    activeAgent.mission = $('mission').value; await persist();
+    $('saveStateLabel').textContent = 'salvo'; setTimeout(() => $('saveStateLabel').textContent = '', 1200);
   });
-
-  $('openPrBtn').addEventListener('click', async () => {
-    const info = activeAgent.repoPath ? await window.agentHub.gitInfo(activeAgent.repoPath) : null;
-    if (!info?.ok || !info.remote) return alert('Remote origin não encontrado.');
-    let url = info.remote.replace(/\.git$/, '');
-    if (url.startsWith('git@github.com:')) url = `https://github.com/${url.slice('git@github.com:'.length)}`;
-    if (!/^https?:\/\//.test(url)) return alert(`Remote não é uma URL web reconhecida: ${info.remote}`);
-    window.agentHub.openExternal(url);
-  });
-
   $('backBtn').addEventListener('click', () => { const v = activeView(); if (v?.canGoBack()) v.goBack(); });
   $('forwardBtn').addEventListener('click', () => { const v = activeView(); if (v?.canGoForward()) v.goForward(); });
   $('reloadBtn').addEventListener('click', () => activeView()?.reload());
-  $('goBtn').addEventListener('click', () => {
-    const url = normalizeUrl($('urlBox').value);
-    $('urlBox').value = url;
-    activeView()?.loadURL(url);
-  });
+  $('goBtn').addEventListener('click', () => { const url = normalizeUrl($('urlBox').value); $('urlBox').value = url; activeView()?.loadURL(url); });
   $('urlBox').addEventListener('keydown', (event) => { if (event.key === 'Enter') $('goBtn').click(); });
 }
 
 async function bootstrap() {
   state = await window.agentHub.getState();
-  bindUi();
-  renderTabs();
+  $('appVersion').textContent = `v${await window.agentHub.getVersion()}`;
+  bindUi(); renderTabs();
   activeAgent = findAgent(state.activeAgentId) || state.agents[0];
   state.activeAgentId = activeAgent.id;
   await activateAgent(activeAgent.id);
   startSuspensionLoop();
+  setTimeout(() => checkUpdates({ silent: true }), 2500);
 }
 
 bootstrap();
