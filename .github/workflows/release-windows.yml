@@ -1,9 +1,6 @@
 name: Windows Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -44,11 +41,7 @@ jobs:
         id: release
         shell: pwsh
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $tag = "${{ inputs.tag }}"
-          } else {
-            $tag = "${{ github.ref_name }}"
-          }
+          $tag = "${{ inputs.tag }}"
           $version = node -p "require('./package.json').version"
           $expected = "v$version"
           if ($tag -ne $expected) {
