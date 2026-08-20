@@ -1,11 +1,19 @@
-# Publicação inicial no GitHub
+# Publicação e fluxo Git
 
-Repositório planejado: `washingtonmsdj/ordax-agent-hub`
+Repositório canônico: `washingtonmsdj/ordax-agent-hub`
 
-A primeira versão é `v0.1.0-dev`.
+Estado inicial publicado: `v0.1.0-dev`.
 
-O repositório deve ser criado vazio, sem README/licença/.gitignore gerados pelo GitHub, porque estes arquivos já fazem parte deste pacote.
+## Fluxo recomendado
 
-Depois de criado, o conteúdo deste pacote pode ser publicado em `main` e marcado com a tag `v0.1.0-dev`.
+```text
+branch -> commit -> push -> pull request -> CI -> revisão -> merge
+```
 
-A atualização automática do aplicativo não faz parte da v0.1.0-dev.
+O `main` deve representar a linha integrada do Agent Hub. Novas funcionalidades devem preferencialmente entrar por branches e PRs separados.
+
+## Releases
+
+A versão de desenvolvimento atual é `0.1.0-dev`. Uma tag/release GitHub formal pode ser criada quando decidirmos congelar um build distribuível.
+
+A atualização automática do aplicativo ainda não faz parte da v0.1.0-dev; ela será adicionada somente depois que a base estiver estável e o fluxo de releases Windows estiver validado.
