@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; frame-src https://chatgpt.com https://*.openai.com https://accounts.google.com;" />
+  <title>OrdaX Agent Hub</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <strong>OrdaX Agent Hub</strong>
+      <span class="muted">multi-account GPT workspace</span>
+    </div>
+    <div class="top-actions">
+      <button id="refreshAllBtn" class="ghost">Atualizar Git</button>
+      <button id="addAgentBtn" class="primary">+ Agente</button>
+    </div>
+  </header>
+
+  <nav id="tabs" class="tabs"></nav>
+
+  <main class="workspace">
+    <section class="browser-pane">
+      <div class="browser-toolbar">
+        <button id="backBtn" title="Voltar">←</button>
+        <button id="forwardBtn" title="Avançar">→</button>
+        <button id="reloadBtn" title="Recarregar">↻</button>
+        <input id="urlBox" value="https://chatgpt.com/" aria-label="URL" />
+        <button id="goBtn">Ir</button>
+        <span id="webStatus" class="status-pill">pronto</span>
+      </div>
+      <div id="webviewHost" class="webview-host"></div>
+    </section>
+
+    <aside class="side-pane">
+      <section class="card">
+        <div class="card-title-row">
+          <h2 id="agentTitle">Agente</h2>
+          <button id="editAgentBtn" class="icon-btn" title="Editar agente">✎</button>
+        </div>
+        <div class="field compact">
+          <label>Conta / identificação</label>
+          <div id="accountLabel" class="value"></div>
+        </div>
+        <div class="field compact">
+          <label>Perfil isolado</label>
+          <div id="profileLabel" class="mono value"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title-row">
+          <h3>Repositório local</h3>
+          <button id="refreshGitBtn" class="icon-btn" title="Atualizar">↻</button>
+        </div>
+        <div class="repo-path-row">
+          <input id="repoPath" readonly placeholder="Selecione o clone local..." />
+          <button id="pickRepoBtn">...</button>
+        </div>
+        <div class="git-grid">
+          <span>Branch</span><strong id="gitBranch" class="mono">—</strong>
+          <span>Esperada</span><strong id="expectedBranch" class="mono">—</strong>
+          <span>HEAD</span><strong id="gitHead" class="mono">—</strong>
+          <span>Status</span><strong id="gitStatus">—</strong>
+        </div>
+        <div id="branchWarning" class="warning hidden"></div>
+        <div class="button-row">
+          <button id="openFolderBtn">Abrir pasta</button>
+          <button id="copyContextBtn">Copiar contexto</button>
+        </div>
+        <div class="changes-wrap">
+          <div class="muted tiny">Mudanças locais (somente leitura)</div>
+          <pre id="gitChanges" class="changes">—</pre>
+        </div>
+      </section>
+
+      <section class="card grow">
+        <div class="card-title-row"><h3>Missão</h3><span id="saveStateLabel" class="muted tiny"></span></div>
+        <textarea id="mission" placeholder="O que este agente deve fazer?"></textarea>
+        <div class="button-row">
+          <button id="saveMissionBtn" class="primary">Salvar missão</button>
+          <button id="openPrBtn">Abrir remoto</button>
+        </div>
+      </section>
+
+      <section class="card memory-card">
+        <div><strong>Economia de memória</strong></div>
+        <div class="muted tiny">Abas inativas são descarregadas após <span id="suspendMinutesLabel"></span> min. A sessão/cookies permanecem no perfil.</div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="modalBackdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <h2 id="modalTitle">Novo agente</h2>
+      <input id="modalAgentId" type="hidden" />
+      <label>Nome<input id="modalName" placeholder="Core Apps" /></label>
+      <label>Conta / identificação<input id="modalAccount" placeholder="conta3@email.com ou Conta GPT 3" /></label>
+      <label>Branch esperada<input id="modalBranch" placeholder="agent/core-apps" /></label>
+      <label>Missão<textarea id="modalMission" rows="5"></textarea></label>
+      <div class="modal-actions">
+        <button id="deleteAgentBtn" class="danger hidden">Excluir</button>
+        <span class="spacer"></span>
+        <button id="cancelModalBtn">Cancelar</button>
+        <button id="saveAgentBtn" class="primary">Salvar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
