@@ -1,7 +1,7 @@
 {
   "name": "ordax-agent-hub",
-  "version": "0.1.0-dev",
-  "description": "Multi-account ChatGPT workspace with isolated sessions and local Git context.",
+  "version": "0.2.0-dev",
+  "description": "Multi-account ChatGPT workspace with isolated sessions, Git worktree awareness and safe local context.",
   "main": "src/main.js",
   "author": "OrdaX",
   "license": "UNLICENSED",
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "dist:win": "electron-builder --win nsis portable --x64"
+    "dist:win": "electron-builder --win nsis portable"
   },
   "devDependencies": {
     "electron": "^37.2.6",
@@ -22,13 +22,6 @@
     "files": [
       "src/**/*",
       "package.json"
-    ],
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "washingtonmsdj",
-        "repo": "ordax-agent-hub"
-      }
     ],
     "win": {
       "target": [
@@ -43,6 +36,13 @@
       "createStartMenuShortcut": true,
       "artifactName": "OrdaX-Agent-Hub-Setup-${version}-${arch}.${ext}"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "washingtonmsdj",
+        "repo": "ordax-agent-hub"
+      }
+    ],
     "portable": {
       "artifactName": "OrdaX-Agent-Hub-Portable-${version}-${arch}.${ext}"
     }

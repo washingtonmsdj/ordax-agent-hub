@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.1.0-dev"
+        description: "Release tag, e.g. v0.2.0-dev"
         required: true
-        default: "v0.1.0-dev"
+        default: "v0.2.0-dev"
 
 permissions:
   contents: write
@@ -37,20 +37,44 @@ jobs:
         run: |
           node --check src/main.js
           node --check src/preload.js
+          node --check src/workspace.js
           node --check src/renderer.js
 
-      - name: Build Windows installer and portable app
-        run: npm run dist:win
-
-      - name: Resolve release tag
+      - name: Resolve and validate release tag
         id: release
         shell: pwsh
         run: |
           if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            "tag=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
+            $tag = "${{ inputs.tag }}"
           } else {
-            "tag=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+            $tag = "${{ github.ref_name }}"
           }
+          $version = node -p "require('./package.json').version"
+          $expected = "v$version"
+          if ($tag -ne $expected) {
+            Write-Error "Release tag $tag does not match package version $expected"
+            exit 1
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Build Windows installer and portable app
+        run: npm run dist:win
+
+      - name: Verify release artifacts and write checksums
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          $setup = "dist/OrdaX-Agent-Hub-Setup-$version-x64.exe"
+          $portable = "dist/OrdaX-Agent-Hub-Portable-$version-x64.exe"
+          foreach ($file in @($setup, $portable)) {
+            if (-not (Test-Path $file)) {
+              Write-Error "Missing expected artifact: $file"
+              exit 1
+            }
+          }
+          Get-FileHash $setup, $portable -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content -Encoding ascii dist/SHA256SUMS.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -64,5 +88,6 @@ jobs:
             dist/*.exe
             dist/*.yml
             dist/*.blockmap
+            dist/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

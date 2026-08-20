@@ -33,20 +33,28 @@ jobs:
         run: |
           node --check src/main.js
           node --check src/preload.js
+          node --check src/workspace.js
           node --check src/renderer.js
 
       - name: Build Windows installer and portable app
         run: npm run dist:win
 
-      - name: Verify Windows artifacts
+      - name: Verify Windows artifacts and write checksums
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path dist -Filter *.exe
-          if ($files.Count -lt 2) {
-            Write-Error "Expected installer and portable .exe artifacts."
-            exit 1
+          $version = node -p "require('./package.json').version"
+          $setup = "dist/OrdaX-Agent-Hub-Setup-$version-x64.exe"
+          $portable = "dist/OrdaX-Agent-Hub-Portable-$version-x64.exe"
+          foreach ($file in @($setup, $portable)) {
+            if (-not (Test-Path $file)) {
+              Write-Error "Missing expected artifact: $file"
+              exit 1
+            }
           }
-          $files | ForEach-Object { Write-Host $_.FullName }
+          Get-FileHash $setup, $portable -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -56,5 +64,6 @@ jobs:
             dist/*.exe
             dist/*.yml
             dist/*.blockmap
+            dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
