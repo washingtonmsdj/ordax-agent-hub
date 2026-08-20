@@ -1,0 +1,4 @@
+OrdaX Agent Hub MVP
+
+This source package is provided for the user's own development workflow.
+Third-party dependencies retain their respective licenses.
