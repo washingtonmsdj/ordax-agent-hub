@@ -1,0 +1,482 @@
+#!/bin/sh
+# ordax-development-agent-supervisor — lifecycle for the mutable DEV/SYSTEM agent.
+# The supervisor reuses the existing root-only device credential but never
+# persists or logs the token. Workspace authority is configured separately.
+#
+# The embedded GitHub mailbox loop is transport only: it can decrypt a payload
+# addressed to this device and submit the exact bytes to the Control Plane. It
+# NEVER executes that payload. ordax-development-agent remains the sole SYSTEM
+# executor and retains the canonical lease/fencing/journal path.
+
+STATE_DIR="${ORDAX_DEVELOP_STATE_DIR:-/run/ordax/development-operator}"
+LOG_FILE="$STATE_DIR/supervisor.log"
+STATUS_FILE="$STATE_DIR/status.env"
+PID_FILE="$STATE_DIR/supervisor.pid"
+AGENT="${ORDAX_DEVELOP_AGENT:-/ordax/control-plane/ordax-development-agent}"
+CREDENTIAL_FILE="${ORDAX_CONTROL_PLANE_CREDENTIAL_FILE:-/mnt/platform/state/control-plane/credentials/device-agent.env}"
+CONFIG_FILE="${ORDAX_DEVELOP_CONFIG_FILE:-/mnt/platform/state/control-plane/development/operator.env}"
+PLATFORM_MOUNT="${ORDAX_DEVELOP_PLATFORM_MOUNT:-/mnt/platform}"
+PERSIST_ROOT="${ORDAX_DEVELOP_PERSIST_ROOT:-$PLATFORM_MOUNT/state/control-plane/development}"
+CANONICAL_WORKSPACE_ROOT="$PERSIST_ROOT/workspace"
+WORKSPACE_HELPER="${ORDAX_DEVELOP_WORKSPACE_HELPER:-/ordax/control-plane/ordax-development-workspace}"
+ADAPTER_ROOT="${ORDAX_DEVELOP_ADAPTER_ROOT:-/ordax/control-plane/development-adapters}"
+CA_BUNDLE="${ORDAX_CONTROL_PLANE_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+RESTART_DELAY="${ORDAX_DEVELOP_RESTART_DELAY:-5}"
+AUTHORITY="${ORDAX_DEVELOP_AUTHORITY:-initramfs-fallback}"
+RUNTIME_ROOT="${ORDAX_DEVELOP_RUNTIME_ROOT:-/}"
+PAYLOAD_RELEASE_ID="${ORDAX_DEVELOP_PAYLOAD_RELEASE_ID:-none}"
+
+SUPABASE_URL="${ORDAX_SUPABASE_URL:-https://eobcxuyvhkvdmkbaihwh.supabase.co}"
+MAILBOX_EDGE_URL="${ORDAX_GITHUB_MAILBOX_EDGE_FUNCTION_URL:-$SUPABASE_URL/functions/v1/ordax-github-mailbox}"
+MAILBOX_STATE_DIR="${ORDAX_GITHUB_MAILBOX_STATE_DIR:-/run/ordax/github-mailbox}"
+MAILBOX_PERSIST_ROOT="${ORDAX_GITHUB_MAILBOX_PERSIST_ROOT:-$PLATFORM_MOUNT/state/control-plane/github-mailbox}"
+MAILBOX_KEY_FILE="$MAILBOX_PERSIST_ROOT/identity.key"
+MAILBOX_CERT_FILE="$MAILBOX_PERSIST_ROOT/identity.crt"
+MAILBOX_LAST_SOURCE_FILE="$MAILBOX_PERSIST_ROOT/last-source.sha256"
+MAILBOX_POLL_INTERVAL="${ORDAX_GITHUB_MAILBOX_POLL_INTERVAL:-5}"
+MAILBOX_HTTP_TIMEOUT="${ORDAX_GITHUB_MAILBOX_HTTP_TIMEOUT:-30}"
+MAILBOX_MAX_BYTES=600000
+MAILBOX_PAYLOAD_MAX_BYTES=400000
+
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 1
+chmod 0700 "$STATE_DIR" 2>/dev/null || true
+printf '%s\n' "$$" >"$PID_FILE"
+chmod 0600 "$PID_FILE" 2>/dev/null || true
+
+log() { printf '[ordax-development-supervisor] %s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+mailbox_log() { printf '[ordax-github-mailbox] %s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+
+status() {
+  _state="$1"; _reason="$2"; _agent_pid="${3:-none}"; _mailbox_pid="${4:-none}"
+  _tmp="$STATUS_FILE.new.$$"
+  {
+    printf 'owner=ordax.development.operator\n'
+    printf 'state=%s\n' "$_state"
+    printf 'reason=%s\n' "$_reason"
+    printf 'agent_pid=%s\n' "$_agent_pid"
+    printf 'github_mailbox_transport_pid=%s\n' "$_mailbox_pid"
+    printf 'authority=DEVELOP+SYSTEM\n'
+    printf 'generic_shell=true\n'
+    printf 'system_exec=true\n'
+    printf 'github_mailbox_transport=embedded-non-executing\n'
+    printf 'payload_mode=%s\n' "$AUTHORITY"
+    printf 'payload_release_id=%s\n' "$PAYLOAD_RELEASE_ID"
+    printf 'runtime_path=%s\n' "$AGENT"
+  } >"$_tmp" && chmod 0600 "$_tmp" 2>/dev/null && mv -f "$_tmp" "$STATUS_FILE"
+}
+
+safe_root_file() {
+  _path="$1"; _mode="$2"
+  [ -f "$_path" ] && [ ! -L "$_path" ] || return 1
+  [ "$(stat -c '%a:%u:%g' "$_path" 2>/dev/null || true)" = "${_mode}:0:0" ]
+}
+
+safe_root_dir() {
+  _path="$1"; _mode="$2"
+  [ -d "$_path" ] && [ ! -L "$_path" ] || return 1
+  [ "$(stat -c '%a:%u:%g' "$_path" 2>/dev/null || true)" = "${_mode}:0:0" ]
+}
+
+hex64() { [ "${#1}" -eq 64 ] && printf '%s' "$1" | grep -Eq '^[0-9a-f]{64}$'; }
+mailbox_uuid() {
+  printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+}
+mailbox_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+
+mailbox_json_string() {
+  _input="$1"; _key="$2"
+  printf '%s' "$_input" | tr '\r\n' '  ' \
+    | sed -n 's/.*"'"$_key"'"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' \
+    | head -1
+}
+
+mailbox_json_true() {
+  _input="$1"; _key="$2"
+  printf '%s' "$_input" | tr '\r\n' '  ' \
+    | grep -Eq '"'"$_key"'"[[:space:]]*:[[:space:]]*true([,}[:space:]]|$)'
+}
+
+mailbox_flush() { sync -f "$1" >/dev/null 2>&1; }
+
+selected_runtime_paths_valid() {
+  case "$AUTHORITY" in
+    platform-release)
+      hex64 "$PAYLOAD_RELEASE_ID" || return 1
+      _expected="$PLATFORM_MOUNT/state/development/sync/ordax.control-plane/releases/$PAYLOAD_RELEASE_ID/root"
+      [ "$RUNTIME_ROOT" = "$_expected" ] || return 1
+      _bin="$RUNTIME_ROOT/ordax/control-plane"
+      _adapters="$_bin/development-adapters"
+      ;;
+    platform-base)
+      [ "$PAYLOAD_RELEASE_ID" = baseline ] && [ "$RUNTIME_ROOT" = "$PLATFORM_MOUNT" ] || return 1
+      _bin="$PLATFORM_MOUNT/services/control-plane/bin"
+      _adapters="$PLATFORM_MOUNT/services/control-plane/development-adapters"
+      ;;
+    initramfs-fallback)
+      [ "$PAYLOAD_RELEASE_ID" = none ] && [ "$RUNTIME_ROOT" = / ] || return 1
+      _bin=/ordax/control-plane
+      _adapters=/ordax/control-plane/development-adapters
+      ;;
+    *) return 1 ;;
+  esac
+  [ "$AGENT" = "$_bin/ordax-development-agent" ] \
+    && [ "$WORKSPACE_HELPER" = "$_bin/ordax-development-workspace" ] \
+    && [ "$ADAPTER_ROOT" = "$_adapters" ] || return 1
+  safe_root_file "$AGENT" 755 && safe_root_file "$WORKSPACE_HELPER" 755 || return 1
+  [ -d "$ADAPTER_ROOT" ] && [ ! -L "$ADAPTER_ROOT" ] \
+    && [ "$(stat -c '%u:%g' "$ADAPTER_ROOT" 2>/dev/null || true)" = 0:0 ] \
+    && stat -c '%a' "$ADAPTER_ROOT" 2>/dev/null | grep -Eq '^(700|755)$'
+}
+
+load_configuration() {
+  safe_root_file "$CREDENTIAL_FILE" 600 || return 1
+  safe_root_file "$CONFIG_FILE" 600 || return 2
+  safe_root_file "$AGENT" 755 || return 3
+  safe_root_file "$WORKSPACE_HELPER" 755 || return 9
+  selected_runtime_paths_valid || return 10
+  [ -r "$CA_BUNDLE" ] || return 4
+
+  ORDAX_DEVICE_ID=$(sed -n 's/^ORDAX_DEVICE_ID=//p' "$CREDENTIAL_FILE" | head -1 | tr -d '\r')
+  ORDAX_DEVICE_TOKEN=$(sed -n 's/^ORDAX_DEVICE_TOKEN=//p' "$CREDENTIAL_FILE" | head -1 | tr -d '\r')
+  ORDAX_DEVELOP_WORKSPACE_ROOT=$(sed -n 's/^ORDAX_DEVELOP_WORKSPACE_ROOT=//p' "$CONFIG_FILE" | head -1 | tr -d '\r')
+
+  case "$ORDAX_DEVICE_ID" in ????????-????-????-????-????????????) ;; *) return 5 ;; esac
+  case "$ORDAX_DEVICE_TOKEN" in ''|*[!0-9a-f]*) return 6 ;; esac
+  [ "${#ORDAX_DEVICE_TOKEN}" -eq 64 ] || return 6
+  [ -n "$ORDAX_DEVELOP_WORKSPACE_ROOT" ] || return 7
+  [ "$ORDAX_DEVELOP_WORKSPACE_ROOT" = "$CANONICAL_WORKSPACE_ROOT" ] || return 8
+  safe_root_dir "$ORDAX_DEVELOP_WORKSPACE_ROOT" 700 || return 8
+
+  export ORDAX_DEVICE_ID ORDAX_DEVICE_TOKEN ORDAX_DEVELOP_WORKSPACE_ROOT
+  export ORDAX_DEVELOP_WORKSPACE_HELPER="$WORKSPACE_HELPER"
+  export ORDAX_DEVELOP_ADAPTER_ROOT="$ADAPTER_ROOT"
+  export ORDAX_DEVELOP_PLATFORM_MOUNT="$PLATFORM_MOUNT"
+  export ORDAX_DEVELOP_PERSIST_ROOT="$PERSIST_ROOT"
+  export SSL_CERT_FILE="$CA_BUNDLE"
+  return 0
+}
+
+mailbox_prepare_roots() {
+  [ "$(id -u 2>/dev/null || echo 1)" = 0 ] || return 1
+  awk -v m="$PLATFORM_MOUNT" '$2==m && $3=="ext4" && $4 !~ /(^|,)ro(,|$)/ {ok=1} END{exit !ok}' \
+    /proc/mounts 2>/dev/null || return 2
+  mkdir -p "$MAILBOX_STATE_DIR" "$MAILBOX_PERSIST_ROOT" || return 3
+  chmod 0700 "$MAILBOX_STATE_DIR" "$MAILBOX_PERSIST_ROOT" || return 4
+  chown 0:0 "$MAILBOX_STATE_DIR" "$MAILBOX_PERSIST_ROOT" || return 5
+  safe_root_dir "$MAILBOX_STATE_DIR" 700 && safe_root_dir "$MAILBOX_PERSIST_ROOT" 700 || return 6
+}
+
+mailbox_durable_line() {
+  _target="$1"; _value="$2"; _dir=${_target%/*}; _tmp="$_target.new.$$"
+  safe_root_dir "$_dir" 700 || return 1
+  [ ! -L "$_target" ] || return 1
+  printf '%s\n' "$_value" >"$_tmp" || return 1
+  chmod 0600 "$_tmp" && chown 0:0 "$_tmp" || { rm -f "$_tmp"; return 1; }
+  mailbox_flush "$_tmp" || { rm -f "$_tmp"; return 1; }
+  mv -f "$_tmp" "$_target" || { rm -f "$_tmp"; return 1; }
+  mailbox_flush "$_dir"
+}
+
+mailbox_identity_valid() {
+  safe_root_file "$MAILBOX_KEY_FILE" 600 && safe_root_file "$MAILBOX_CERT_FILE" 644 || return 1
+  openssl pkey -in "$MAILBOX_KEY_FILE" -check -noout >/dev/null 2>&1 || return 1
+  openssl x509 -in "$MAILBOX_CERT_FILE" -noout -checkend 0 >/dev/null 2>&1 || return 1
+  _key_public="$(openssl pkey -in "$MAILBOX_KEY_FILE" -pubout 2>/dev/null)" || return 1
+  _cert_public="$(openssl x509 -in "$MAILBOX_CERT_FILE" -pubkey -noout 2>/dev/null)" || return 1
+  [ -n "$_key_public" ] && [ "$_key_public" = "$_cert_public" ]
+}
+
+mailbox_ensure_identity() {
+  if [ -e "$MAILBOX_KEY_FILE" ] || [ -e "$MAILBOX_CERT_FILE" ]; then
+    mailbox_identity_valid
+    return $?
+  fi
+  _key_tmp="$MAILBOX_PERSIST_ROOT/.identity.key.new.$$"
+  _cert_tmp="$MAILBOX_PERSIST_ROOT/.identity.crt.new.$$"
+  rm -f "$_key_tmp" "$_cert_tmp"
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes \
+    -keyout "$_key_tmp" -out "$_cert_tmp" -days 3650 \
+    -subj "/CN=ordax-github-mailbox-$ORDAX_DEVICE_ID" -config /dev/null >/dev/null 2>&1 \
+    || { rm -f "$_key_tmp" "$_cert_tmp"; return 1; }
+  chmod 0600 "$_key_tmp" && chmod 0644 "$_cert_tmp" \
+    && chown 0:0 "$_key_tmp" "$_cert_tmp" \
+    || { rm -f "$_key_tmp" "$_cert_tmp"; return 1; }
+  mailbox_flush "$_key_tmp" && mailbox_flush "$_cert_tmp" \
+    || { rm -f "$_key_tmp" "$_cert_tmp"; return 1; }
+  mv "$_key_tmp" "$MAILBOX_KEY_FILE" && mv "$_cert_tmp" "$MAILBOX_CERT_FILE" || return 1
+  mailbox_flush "$MAILBOX_PERSIST_ROOT"
+  mailbox_identity_valid
+}
+
+mailbox_decode_http_body() {
+  _raw="$1"; _out="$2"; _allow_404="${3:-no}"
+  _status="$(sed -n '1s/^HTTP\/[0-9.]*[[:space:]]\([0-9][0-9][0-9]\).*/\1/p' "$_raw")"
+  if [ "$_status" = 404 ] && [ "$_allow_404" = yes ]; then return 44; fi
+  case "$_status" in 2??) ;; *) return 22 ;; esac
+  awk '
+    function hd(c) { if(c>="0"&&c<="9")return c+0;c=tolower(c);if(c=="a")return 10;if(c=="b")return 11;if(c=="c")return 12;if(c=="d")return 13;if(c=="e")return 14;if(c=="f")return 15;return -1 }
+    function hs(v,i,d,t) { sub(/;.*/,"",v);if(v!~/^[0-9A-Fa-f]+$/)return -1;t=0;for(i=1;i<=length(v);i++){d=hd(substr(v,i,1));if(d<0)return -1;t=t*16+d;if(t>1048576)return -1}return t }
+    BEGIN{headers=1;chunked=0;phase="size";complete=0}
+    headers{line=$0;sub(/\r$/, "", line);lower=tolower(line);if(lower~/^transfer-encoding:[[:space:]]*chunked([[:space:]]*$|[[:space:]]*,)/)chunked=1;if(line=="")headers=0;next}
+    !chunked{line=$0;sub(/\r$/, "", line);printf "%s",line;next}
+    phase=="size"{line=$0;sub(/\r$/, "", line);declared=hs(line);if(declared<0)exit 66;if(declared==0){complete=1;exit 0}phase="data";next}
+    phase=="data"{line=$0;sub(/\r$/, "", line);if(length(line)!=declared)exit 67;printf "%s",line;phase="size";next}
+    END{if(chunked&&!complete)exit 68}
+  ' "$_raw" >"$_out"
+}
+
+mailbox_edge_call() {
+  _body="$1"; _out="$2"
+  case "$MAILBOX_EDGE_URL" in https://*) ;; *) return 64 ;; esac
+  _expected="${SUPABASE_URL#https://}"; _expected="${_expected%%/*}"
+  _authority="${MAILBOX_EDGE_URL#https://}"; _authority="${_authority%%/*}"
+  [ "$_authority" = "$_expected" ] || return 64
+  _host="${_authority%%:*}"; case "$_host" in ''|*[!A-Za-z0-9.-]*) return 64 ;; esac
+  _hostport="$_authority"; case "$_hostport" in *:*) ;; *) _hostport="$_hostport:443" ;; esac
+  _path="/${MAILBOX_EDGE_URL#https://*/}"
+  _bytes="$(wc -c <"$_body" | tr -d ' ')"; mailbox_uint "$_bytes" || return 65
+  _raw="$MAILBOX_STATE_DIR/edge.raw"; rm -f "$_raw"
+  {
+    printf 'POST %s HTTP/1.1\r\n' "$_path"
+    printf 'Host: %s\r\n' "$_authority"
+    printf 'Content-Type: application/json\r\n'
+    printf 'Content-Length: %s\r\n' "$_bytes"
+    printf 'X-Ordax-Device-Token: %s\r\n' "$ORDAX_DEVICE_TOKEN"
+    printf 'Connection: close\r\n\r\n'
+    cat "$_body"
+  } | busybox timeout "$MAILBOX_HTTP_TIMEOUT" openssl s_client \
+      -quiet -ign_eof -connect "$_hostport" -servername "$_host" \
+      -verify_return_error -verify_hostname "$_host" -CAfile "$CA_BUNDLE" \
+      >"$_raw" 2>/dev/null
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_decode_http_body "$_raw" "$_out" no; _rc=$?; fi
+  rm -f "$_raw"
+  return "$_rc"
+}
+
+mailbox_raw_get() {
+  _url="$1"; _out="$2"
+  case "$_url" in https://raw.githubusercontent.com/*) ;; *) return 64 ;; esac
+  case "$_url" in *[![:print:]]*|*' '*|*'@'*|*'#'*|*'\\'*) return 64 ;; esac
+  _authority=raw.githubusercontent.com
+  _path="/${_url#https://raw.githubusercontent.com/}"
+  _raw="$MAILBOX_STATE_DIR/raw-http.response"; rm -f "$_raw"
+  {
+    printf 'GET %s HTTP/1.1\r\n' "$_path"
+    printf 'Host: %s\r\n' "$_authority"
+    printf 'User-Agent: ordax-github-mailbox-transport/1\r\n'
+    printf 'Accept: application/json\r\n'
+    printf 'Connection: close\r\n\r\n'
+  } | busybox timeout "$MAILBOX_HTTP_TIMEOUT" openssl s_client \
+      -quiet -ign_eof -connect "$_authority:443" -servername "$_authority" \
+      -verify_return_error -verify_hostname "$_authority" -CAfile "$CA_BUNDLE" \
+      >"$_raw" 2>/dev/null
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_decode_http_body "$_raw" "$_out" yes; _rc=$?; fi
+  rm -f "$_raw"
+  return "$_rc"
+}
+
+mailbox_register_key() {
+  _body="$MAILBOX_STATE_DIR/register.json"; _out="$MAILBOX_STATE_DIR/register.out"
+  _cert_b64="$(busybox base64 <"$MAILBOX_CERT_FILE" | tr -d '\r\n')" || return 1
+  _cert_sha="$(sha256sum "$MAILBOX_CERT_FILE" | awk '{print $1}')"; hex64 "$_cert_sha" || return 1
+  printf '{"device_id":"%s","operation":"register_key","public_cert_pem_b64":"%s","public_cert_sha256":"%s"}' \
+    "$ORDAX_DEVICE_ID" "$_cert_b64" "$_cert_sha" >"$_body"
+  mailbox_edge_call "$_body" "$_out"; _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_json_true "$(cat "$_out" 2>/dev/null || true)" ok || _rc=1; fi
+  rm -f "$_body" "$_out"
+  return "$_rc"
+}
+
+mailbox_load_binding() {
+  _body="$MAILBOX_STATE_DIR/binding.json"; _out="$MAILBOX_STATE_DIR/binding.out"
+  printf '{"device_id":"%s","operation":"binding"}' "$ORDAX_DEVICE_ID" >"$_body"
+  mailbox_edge_call "$_body" "$_out" || { rm -f "$_body" "$_out"; return 1; }
+  _response="$(cat "$_out" 2>/dev/null || true)"
+  MAILBOX_URL="$(mailbox_json_string "$_response" raw_url)"
+  _remote_cert_sha="$(mailbox_json_string "$_response" public_cert_sha256)"
+  _local_cert_sha="$(sha256sum "$MAILBOX_CERT_FILE" | awk '{print $1}')"
+  rm -f "$_body" "$_out"
+  case "$MAILBOX_URL" in https://raw.githubusercontent.com/*) ;; *) return 1 ;; esac
+  hex64 "$_remote_cert_sha" && [ "$_remote_cert_sha" = "$_local_cert_sha" ]
+}
+
+mailbox_last_source() {
+  if safe_root_file "$MAILBOX_LAST_SOURCE_FILE" 600; then
+    sed -n '1p' "$MAILBOX_LAST_SOURCE_FILE" 2>/dev/null || true
+  fi
+}
+
+mailbox_accept_payload() {
+  _request_id="$1"; _source_sha="$2"; _payload_file="$3"
+  _body="$MAILBOX_STATE_DIR/accept.json"; _out="$MAILBOX_STATE_DIR/accept.out"
+  _payload_b64="$(busybox base64 <"$_payload_file" | tr -d '\r\n')" || return 1
+  printf '{"device_id":"%s","operation":"accept","request_id":"%s","observed_source_sha256":"%s","payload_canonical_b64":"%s"}' \
+    "$ORDAX_DEVICE_ID" "$_request_id" "$_source_sha" "$_payload_b64" >"$_body"
+  mailbox_edge_call "$_body" "$_out"; _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_json_true "$(cat "$_out" 2>/dev/null || true)" ok || _rc=1; fi
+  rm -f "$_body" "$_out"
+  return "$_rc"
+}
+
+mailbox_process_file() {
+  _file="$1"; _source_sha="$2"
+  _size="$(stat -c '%s' "$_file" 2>/dev/null || echo invalid)"
+  mailbox_uint "$_size" && [ "$_size" -gt 0 ] && [ "$_size" -le "$MAILBOX_MAX_BYTES" ] || return 2
+  _mailbox="$(cat "$_file")"
+  _schema="$(mailbox_json_string "$_mailbox" schema)"
+  [ "$_schema" = ordax.github-mailbox.empty/1 ] && return 3
+  [ "$_schema" = ordax.github-mailbox/1 ] || return 2
+  _request_id="$(mailbox_json_string "$_mailbox" request_id)"
+  _device_id="$(mailbox_json_string "$_mailbox" device_id)"
+  _cert_sha="$(mailbox_json_string "$_mailbox" public_cert_sha256)"
+  _cipher_sha="$(mailbox_json_string "$_mailbox" ciphertext_sha256)"
+  _cipher_b64="$(mailbox_json_string "$_mailbox" ciphertext_b64)"
+  _local_cert_sha="$(sha256sum "$MAILBOX_CERT_FILE" | awk '{print $1}')"
+  mailbox_uuid "$_request_id" && [ "$_device_id" = "$ORDAX_DEVICE_ID" ] \
+    && hex64 "$_cert_sha" && [ "$_cert_sha" = "$_local_cert_sha" ] \
+    && hex64 "$_cipher_sha" && [ -n "$_cipher_b64" ] \
+    && [ "${#_cipher_b64}" -le 560000 ] && [ $((${#_cipher_b64} % 4)) -eq 0 ] \
+    && printf '%s' "$_cipher_b64" | grep -Eq '^[A-Za-z0-9+/]*={0,2}$' || return 2
+
+  _cipher_file="$MAILBOX_STATE_DIR/cipher.der"; _payload_file="$MAILBOX_STATE_DIR/payload.json"
+  printf '%s' "$_cipher_b64" | busybox base64 -d >"$_cipher_file" 2>/dev/null \
+    || { rm -f "$_cipher_file" "$_payload_file"; return 2; }
+  [ "$(sha256sum "$_cipher_file" | awk '{print $1}')" = "$_cipher_sha" ] \
+    || { rm -f "$_cipher_file" "$_payload_file"; return 2; }
+  openssl cms -decrypt -binary -inform DER -in "$_cipher_file" \
+    -recip "$MAILBOX_CERT_FILE" -inkey "$MAILBOX_KEY_FILE" -out "$_payload_file" >/dev/null 2>&1 \
+    || { rm -f "$_cipher_file" "$_payload_file"; return 2; }
+  rm -f "$_cipher_file"
+  _payload_size="$(stat -c '%s' "$_payload_file" 2>/dev/null || echo invalid)"
+  mailbox_uint "$_payload_size" && [ "$_payload_size" -gt 0 ] \
+    && [ "$_payload_size" -le "$MAILBOX_PAYLOAD_MAX_BYTES" ] \
+    || { rm -f "$_payload_file"; return 2; }
+  mailbox_accept_payload "$_request_id" "$_source_sha" "$_payload_file"
+  _rc=$?; rm -f "$_payload_file"
+  [ "$_rc" -eq 0 ] || return 1
+  mailbox_log "accepted request=$_request_id source=$_source_sha"
+  return 0
+}
+
+mailbox_loop() {
+  mailbox_prepare_roots; _prepare_rc=$?
+  [ "$_prepare_rc" -eq 0 ] || { mailbox_log "stage=prepare_roots state=FAIL code=$_prepare_rc"; return 70; }
+  mailbox_uuid "$ORDAX_DEVICE_ID" || { mailbox_log 'stage=device_identity state=FAIL code=invalid_uuid'; return 71; }
+  [ -n "$ORDAX_DEVICE_TOKEN" ] && [ "${#ORDAX_DEVICE_TOKEN}" -le 512 ] \
+    || { mailbox_log 'stage=device_identity state=FAIL code=invalid_token_shape'; return 72; }
+  command -v openssl >/dev/null 2>&1 \
+    || { mailbox_log 'stage=openssl state=FAIL code=unavailable'; return 73; }
+  mailbox_ensure_identity; _identity_rc=$?
+  [ "$_identity_rc" -eq 0 ] \
+    || { mailbox_log "stage=identity state=FAIL code=$_identity_rc"; return 74; }
+  MAILBOX_URL=""; _binding_retry=60
+  mailbox_log "transport started device=$ORDAX_DEVICE_ID"
+  while :; do
+    if [ -z "$MAILBOX_URL" ] || [ "$_binding_retry" -ge 60 ]; then
+      mailbox_register_key; _register_rc=$?
+      if [ "$_register_rc" -ne 0 ]; then
+        mailbox_log "stage=register_key state=RETRY code=$_register_rc"
+        MAILBOX_URL=""
+        sleep "$MAILBOX_POLL_INTERVAL"
+        continue
+      fi
+      mailbox_load_binding; _binding_rc=$?
+      if [ "$_binding_rc" -ne 0 ]; then
+        mailbox_log "stage=load_binding state=RETRY code=$_binding_rc"
+        MAILBOX_URL=""
+        sleep "$MAILBOX_POLL_INTERVAL"
+        continue
+      fi
+      _binding_retry=0
+      mailbox_log 'stage=load_binding state=PASS'
+    fi
+    _binding_retry=$((_binding_retry + 1))
+    _file="$MAILBOX_STATE_DIR/request.json"
+    mailbox_raw_get "$MAILBOX_URL" "$_file"; _get_rc=$?
+    if [ "$_get_rc" -eq 44 ]; then
+      rm -f "$_file"; sleep "$MAILBOX_POLL_INTERVAL"; continue
+    elif [ "$_get_rc" -ne 0 ]; then
+      rm -f "$_file"; mailbox_log "mailbox fetch unavailable rc=$_get_rc"; sleep "$MAILBOX_POLL_INTERVAL"; continue
+    fi
+    _source_sha="$(sha256sum "$_file" | awk '{print $1}')"
+    if ! hex64 "$_source_sha"; then rm -f "$_file"; sleep "$MAILBOX_POLL_INTERVAL"; continue; fi
+    if [ "$(mailbox_last_source)" = "$_source_sha" ]; then rm -f "$_file"; sleep "$MAILBOX_POLL_INTERVAL"; continue; fi
+    mailbox_process_file "$_file" "$_source_sha"; _process_rc=$?; rm -f "$_file"
+    case "$_process_rc" in
+      0|2|3) mailbox_durable_line "$MAILBOX_LAST_SOURCE_FILE" "$_source_sha" || true ;;
+      1) mailbox_log "mailbox request not accepted source=$_source_sha" ;;
+    esac
+    sleep "$MAILBOX_POLL_INTERVAL"
+  done
+}
+
+child_pid=""
+mailbox_pid=""
+
+terminate_pid() {
+  _pid="$1"
+  case "$_pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_pid" -gt 1 ] 2>/dev/null || return 0
+  kill -TERM "$_pid" 2>/dev/null || true
+  _i=0
+  while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 10 ]; do sleep 1; _i=$((_i+1)); done
+  kill -KILL "$_pid" 2>/dev/null || true
+  wait "$_pid" 2>/dev/null || true
+}
+
+start_mailbox() {
+  mailbox_loop &
+  mailbox_pid=$!
+  log "github mailbox transport started pid=$mailbox_pid"
+}
+
+shutdown() {
+  status stopping signal "${child_pid:-none}" "${mailbox_pid:-none}"
+  terminate_pid "${mailbox_pid:-}"
+  terminate_pid "${child_pid:-}"
+  mailbox_pid=""; child_pid=""
+  rm -f "$PID_FILE" 2>/dev/null || true
+  status stopped signal none none
+  exit 0
+}
+trap shutdown TERM INT HUP
+
+status waiting configuration none none
+log "supervisor started pid=$$"
+while :; do
+  load_configuration
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    status waiting "configuration_$_rc" none none
+    sleep "$RESTART_DELAY"
+    continue
+  fi
+
+  status starting configured none none
+  start_mailbox
+  "$AGENT" >>"$LOG_FILE" 2>&1 &
+  child_pid=$!
+  status running agent_started "$child_pid" "$mailbox_pid"
+  log "agent started pid=$child_pid"
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if ! kill -0 "$mailbox_pid" 2>/dev/null; then
+      wait "$mailbox_pid" 2>/dev/null || true
+      mailbox_pid=""
+      start_mailbox
+      status running mailbox_restarted "$child_pid" "$mailbox_pid"
+    fi
+    sleep 5
+  done
+
+  wait "$child_pid" 2>/dev/null
+  rc=$?
+  log "agent exited pid=$child_pid rc=$rc"
+  child_pid=""
+  terminate_pid "$mailbox_pid"
+  mailbox_pid=""
+  status backoff "agent_exit_$rc" none none
+  sleep "$RESTART_DELAY"
+done
