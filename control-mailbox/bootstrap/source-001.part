@@ -1,0 +1,150 @@
+  export ORDAX_DEVELOP_WORKSPACE_HELPER="$WORKSPACE_HELPER"
+  export ORDAX_DEVELOP_ADAPTER_ROOT="$ADAPTER_ROOT"
+  export ORDAX_DEVELOP_PLATFORM_MOUNT="$PLATFORM_MOUNT"
+  export ORDAX_DEVELOP_PERSIST_ROOT="$PERSIST_ROOT"
+  export SSL_CERT_FILE="$CA_BUNDLE"
+  return 0
+}
+
+mailbox_prepare_roots() {
+  [ "$(id -u 2>/dev/null || echo 1)" = 0 ] || return 1
+  awk -v m="$PLATFORM_MOUNT" '$2==m && $3=="ext4" && $4 !~ /(^|,)ro(,|$)/ {ok=1} END{exit !ok}' \
+    /proc/mounts 2>/dev/null || return 2
+  mkdir -p "$MAILBOX_STATE_DIR" "$MAILBOX_PERSIST_ROOT" || return 3
+  chmod 0700 "$MAILBOX_STATE_DIR" "$MAILBOX_PERSIST_ROOT" || return 4
+  chown 0:0 "$MAILBOX_STATE_DIR" "$MAILBOX_PERSIST_ROOT" || return 5
+  safe_root_dir "$MAILBOX_STATE_DIR" 700 && safe_root_dir "$MAILBOX_PERSIST_ROOT" 700 || return 6
+}
+
+mailbox_durable_line() {
+  _target="$1"; _value="$2"; _dir=${_target%/*}; _tmp="$_target.new.$$"
+  safe_root_dir "$_dir" 700 || return 1
+  [ ! -L "$_target" ] || return 1
+  printf '%s\n' "$_value" >"$_tmp" || return 1
+  chmod 0600 "$_tmp" && chown 0:0 "$_tmp" || { rm -f "$_tmp"; return 1; }
+  mailbox_flush "$_tmp" || { rm -f "$_tmp"; return 1; }
+  mv -f "$_tmp" "$_target" || { rm -f "$_tmp"; return 1; }
+  mailbox_flush "$_dir"
+}
+
+mailbox_ensure_identity() {
+  if [ -e "$MAILBOX_KEY_FILE" ] || [ -e "$MAILBOX_CERT_FILE" ]; then
+    safe_root_file "$MAILBOX_KEY_FILE" 600 && safe_root_file "$MAILBOX_CERT_FILE" 644 || return 1
+    openssl x509 -in "$MAILBOX_CERT_FILE" -noout >/dev/null 2>&1
+    return $?
+  fi
+  _key_tmp="$MAILBOX_PERSIST_ROOT/.identity.key.new.$$"
+  _cert_tmp="$MAILBOX_PERSIST_ROOT/.identity.crt.new.$$"
+  rm -f "$_key_tmp" "$_cert_tmp"
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes \
+    -keyout "$_key_tmp" -out "$_cert_tmp" -days 3650 \
+    -subj "/CN=ordax-github-mailbox-$ORDAX_DEVICE_ID" >/dev/null 2>&1 \
+    || { rm -f "$_key_tmp" "$_cert_tmp"; return 1; }
+  chmod 0600 "$_key_tmp" && chmod 0644 "$_cert_tmp" \
+    && chown 0:0 "$_key_tmp" "$_cert_tmp" \
+    || { rm -f "$_key_tmp" "$_cert_tmp"; return 1; }
+  mailbox_flush "$_key_tmp" && mailbox_flush "$_cert_tmp" \
+    || { rm -f "$_key_tmp" "$_cert_tmp"; return 1; }
+  mv "$_key_tmp" "$MAILBOX_KEY_FILE" && mv "$_cert_tmp" "$MAILBOX_CERT_FILE" || return 1
+  mailbox_flush "$MAILBOX_PERSIST_ROOT"
+  safe_root_file "$MAILBOX_KEY_FILE" 600 && safe_root_file "$MAILBOX_CERT_FILE" 644
+}
+
+mailbox_decode_http_body() {
+  _raw="$1"; _out="$2"; _allow_404="${3:-no}"
+  _status="$(sed -n '1s/^HTTP\/[0-9.]*[[:space:]]\([0-9][0-9][0-9]\).*/\1/p' "$_raw")"
+  if [ "$_status" = 404 ] && [ "$_allow_404" = yes ]; then return 44; fi
+  case "$_status" in 2??) ;; *) return 22 ;; esac
+  awk '
+    function hd(c) { if(c>="0"&&c<="9")return c+0;c=tolower(c);if(c=="a")return 10;if(c=="b")return 11;if(c=="c")return 12;if(c=="d")return 13;if(c=="e")return 14;if(c=="f")return 15;return -1 }
+    function hs(v,i,d,t) { sub(/;.*/,"",v);if(v!~/^[0-9A-Fa-f]+$/)return -1;t=0;for(i=1;i<=length(v);i++){d=hd(substr(v,i,1));if(d<0)return -1;t=t*16+d;if(t>1048576)return -1}return t }
+    BEGIN{headers=1;chunked=0;phase="size";complete=0}
+    headers{line=$0;sub(/\r$/, "", line);lower=tolower(line);if(lower~/^transfer-encoding:[[:space:]]*chunked([[:space:]]*$|[[:space:]]*,)/)chunked=1;if(line=="")headers=0;next}
+    !chunked{line=$0;sub(/\r$/, "", line);printf "%s",line;next}
+    phase=="size"{line=$0;sub(/\r$/, "", line);declared=hs(line);if(declared<0)exit 66;if(declared==0){complete=1;exit 0}phase="data";next}
+    phase=="data"{line=$0;sub(/\r$/, "", line);if(length(line)!=declared)exit 67;printf "%s",line;phase="size";next}
+    END{if(chunked&&!complete)exit 68}
+  ' "$_raw" >"$_out"
+}
+
+mailbox_edge_call() {
+  _body="$1"; _out="$2"
+  case "$MAILBOX_EDGE_URL" in https://*) ;; *) return 64 ;; esac
+  _expected="${SUPABASE_URL#https://}"; _expected="${_expected%%/*}"
+  _authority="${MAILBOX_EDGE_URL#https://}"; _authority="${_authority%%/*}"
+  [ "$_authority" = "$_expected" ] || return 64
+  _host="${_authority%%:*}"; case "$_host" in ''|*[!A-Za-z0-9.-]*) return 64 ;; esac
+  _hostport="$_authority"; case "$_hostport" in *:*) ;; *) _hostport="$_hostport:443" ;; esac
+  _path="/${MAILBOX_EDGE_URL#https://*/}"
+  _bytes="$(wc -c <"$_body" | tr -d ' ')"; mailbox_uint "$_bytes" || return 65
+  _raw="$MAILBOX_STATE_DIR/edge.raw"; rm -f "$_raw"
+  {
+    printf 'POST %s HTTP/1.1\r\n' "$_path"
+    printf 'Host: %s\r\n' "$_authority"
+    printf 'Content-Type: application/json\r\n'
+    printf 'Content-Length: %s\r\n' "$_bytes"
+    printf 'X-Ordax-Device-Token: %s\r\n' "$ORDAX_DEVICE_TOKEN"
+    printf 'Connection: close\r\n\r\n'
+    cat "$_body"
+  } | busybox timeout "$MAILBOX_HTTP_TIMEOUT" openssl s_client \
+      -quiet -ign_eof -connect "$_hostport" -servername "$_host" \
+      -verify_return_error -verify_hostname "$_host" -CAfile "$CA_BUNDLE" \
+      >"$_raw" 2>/dev/null
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_decode_http_body "$_raw" "$_out" no; _rc=$?; fi
+  rm -f "$_raw"
+  return "$_rc"
+}
+
+mailbox_raw_get() {
+  _url="$1"; _out="$2"
+  case "$_url" in https://raw.githubusercontent.com/*) ;; *) return 64 ;; esac
+  case "$_url" in *[![:print:]]*|*' '*|*'@'*|*'#'*|*'\\'*) return 64 ;; esac
+  _authority=raw.githubusercontent.com
+  _path="/${_url#https://raw.githubusercontent.com/}"
+  _raw="$MAILBOX_STATE_DIR/raw-http.response"; rm -f "$_raw"
+  {
+    printf 'GET %s HTTP/1.1\r\n' "$_path"
+    printf 'Host: %s\r\n' "$_authority"
+    printf 'User-Agent: ordax-github-mailbox-transport/1\r\n'
+    printf 'Accept: application/json\r\n'
+    printf 'Connection: close\r\n\r\n'
+  } | busybox timeout "$MAILBOX_HTTP_TIMEOUT" openssl s_client \
+      -quiet -ign_eof -connect "$_authority:443" -servername "$_authority" \
+      -verify_return_error -verify_hostname "$_authority" -CAfile "$CA_BUNDLE" \
+      >"$_raw" 2>/dev/null
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_decode_http_body "$_raw" "$_out" yes; _rc=$?; fi
+  rm -f "$_raw"
+  return "$_rc"
+}
+
+mailbox_register_key() {
+  _body="$MAILBOX_STATE_DIR/register.json"; _out="$MAILBOX_STATE_DIR/register.out"
+  _cert_b64="$(busybox base64 <"$MAILBOX_CERT_FILE" | tr -d '\r\n')" || return 1
+  _cert_sha="$(sha256sum "$MAILBOX_CERT_FILE" | awk '{print $1}')"; hex64 "$_cert_sha" || return 1
+  printf '{"device_id":"%s","operation":"register_key","public_cert_pem_b64":"%s","public_cert_sha256":"%s"}' \
+    "$ORDAX_DEVICE_ID" "$_cert_b64" "$_cert_sha" >"$_body"
+  mailbox_edge_call "$_body" "$_out"; _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_json_true "$(cat "$_out" 2>/dev/null || true)" ok || _rc=1; fi
+  rm -f "$_body" "$_out"
+  return "$_rc"
+}
+
+mailbox_load_binding() {
+  _body="$MAILBOX_STATE_DIR/binding.json"; _out="$MAILBOX_STATE_DIR/binding.out"
+  printf '{"device_id":"%s","operation":"binding"}' "$ORDAX_DEVICE_ID" >"$_body"
+  mailbox_edge_call "$_body" "$_out" || { rm -f "$_body" "$_out"; return 1; }
+  _response="$(cat "$_out" 2>/dev/null || true)"
+  MAILBOX_URL="$(mailbox_json_string "$_response" raw_url)"
+  _remote_cert_sha="$(mailbox_json_string "$_response" public_cert_sha256)"
+  _local_cert_sha="$(sha256sum "$MAILBOX_CERT_FILE" | awk '{print $1}')"
+  rm -f "$_body" "$_out"
+  case "$MAILBOX_URL" in https://raw.githubusercontent.com/*) ;; *) return 1 ;; esac
+  hex64 "$_remote_cert_sha" && [ "$_remote_cert_sha" = "$_local_cert_sha" ]
+}
+
+mailbox_last_source() {
+  if safe_root_file "$MAILBOX_LAST_SOURCE_FILE" 600; then
+    sed -n '1p' "$MAILBOX_LAST_SOURCE_FILE" 2>/dev/null || true
+  fi
