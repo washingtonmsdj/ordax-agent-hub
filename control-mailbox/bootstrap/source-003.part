@@ -1,0 +1,10 @@
+
+  wait "$child_pid" 2>/dev/null
+  rc=$?
+  log "agent exited pid=$child_pid rc=$rc"
+  child_pid=""
+  terminate_pid "$mailbox_pid"
+  mailbox_pid=""
+  status backoff "agent_exit_$rc" none none
+  sleep "$RESTART_DELAY"
+done
