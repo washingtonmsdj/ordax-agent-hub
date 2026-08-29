@@ -1,0 +1,150 @@
+}
+
+mailbox_accept_payload() {
+  _request_id="$1"; _source_sha="$2"; _payload_file="$3"
+  _body="$MAILBOX_STATE_DIR/accept.json"; _out="$MAILBOX_STATE_DIR/accept.out"
+  _payload_b64="$(busybox base64 <"$_payload_file" | tr -d '\r\n')" || return 1
+  printf '{"device_id":"%s","operation":"accept","request_id":"%s","observed_source_sha256":"%s","payload_canonical_b64":"%s"}' \
+    "$ORDAX_DEVICE_ID" "$_request_id" "$_source_sha" "$_payload_b64" >"$_body"
+  mailbox_edge_call "$_body" "$_out"; _rc=$?
+  if [ "$_rc" -eq 0 ]; then mailbox_json_true "$(cat "$_out" 2>/dev/null || true)" ok || _rc=1; fi
+  rm -f "$_body" "$_out"
+  return "$_rc"
+}
+
+mailbox_process_file() {
+  _file="$1"; _source_sha="$2"
+  _size="$(stat -c '%s' "$_file" 2>/dev/null || echo invalid)"
+  mailbox_uint "$_size" && [ "$_size" -gt 0 ] && [ "$_size" -le "$MAILBOX_MAX_BYTES" ] || return 2
+  _mailbox="$(cat "$_file")"
+  _schema="$(mailbox_json_string "$_mailbox" schema)"
+  [ "$_schema" = ordax.github-mailbox.empty/1 ] && return 3
+  [ "$_schema" = ordax.github-mailbox/1 ] || return 2
+  _request_id="$(mailbox_json_string "$_mailbox" request_id)"
+  _device_id="$(mailbox_json_string "$_mailbox" device_id)"
+  _cert_sha="$(mailbox_json_string "$_mailbox" public_cert_sha256)"
+  _cipher_sha="$(mailbox_json_string "$_mailbox" ciphertext_sha256)"
+  _cipher_b64="$(mailbox_json_string "$_mailbox" ciphertext_b64)"
+  _local_cert_sha="$(sha256sum "$MAILBOX_CERT_FILE" | awk '{print $1}')"
+  mailbox_uuid "$_request_id" && [ "$_device_id" = "$ORDAX_DEVICE_ID" ] \
+    && hex64 "$_cert_sha" && [ "$_cert_sha" = "$_local_cert_sha" ] \
+    && hex64 "$_cipher_sha" && [ -n "$_cipher_b64" ] \
+    && [ "${#_cipher_b64}" -le 560000 ] && [ $((${#_cipher_b64} % 4)) -eq 0 ] \
+    && printf '%s' "$_cipher_b64" | grep -Eq '^[A-Za-z0-9+/]*={0,2}$' || return 2
+
+  _cipher_file="$MAILBOX_STATE_DIR/cipher.der"; _payload_file="$MAILBOX_STATE_DIR/payload.json"
+  printf '%s' "$_cipher_b64" | busybox base64 -d >"$_cipher_file" 2>/dev/null \
+    || { rm -f "$_cipher_file" "$_payload_file"; return 2; }
+  [ "$(sha256sum "$_cipher_file" | awk '{print $1}')" = "$_cipher_sha" ] \
+    || { rm -f "$_cipher_file" "$_payload_file"; return 2; }
+  openssl cms -decrypt -binary -inform DER -in "$_cipher_file" \
+    -recip "$MAILBOX_CERT_FILE" -inkey "$MAILBOX_KEY_FILE" -out "$_payload_file" >/dev/null 2>&1 \
+    || { rm -f "$_cipher_file" "$_payload_file"; return 2; }
+  rm -f "$_cipher_file"
+  _payload_size="$(stat -c '%s' "$_payload_file" 2>/dev/null || echo invalid)"
+  mailbox_uint "$_payload_size" && [ "$_payload_size" -gt 0 ] \
+    && [ "$_payload_size" -le "$MAILBOX_PAYLOAD_MAX_BYTES" ] \
+    || { rm -f "$_payload_file"; return 2; }
+  mailbox_accept_payload "$_request_id" "$_source_sha" "$_payload_file"
+  _rc=$?; rm -f "$_payload_file"
+  [ "$_rc" -eq 0 ] || return 1
+  mailbox_log "accepted request=$_request_id source=$_source_sha"
+  return 0
+}
+
+mailbox_loop() {
+  mailbox_prepare_roots || { mailbox_log 'persistent mailbox state unavailable'; return 70; }
+  mailbox_uuid "$ORDAX_DEVICE_ID" || return 71
+  [ -n "$ORDAX_DEVICE_TOKEN" ] && [ "${#ORDAX_DEVICE_TOKEN}" -le 512 ] || return 72
+  command -v openssl >/dev/null 2>&1 || return 73
+  mailbox_ensure_identity || { mailbox_log 'mailbox identity unavailable'; return 74; }
+  MAILBOX_URL=""; _binding_retry=60
+  mailbox_log "transport started device=$ORDAX_DEVICE_ID"
+  while :; do
+    if [ -z "$MAILBOX_URL" ] || [ "$_binding_retry" -ge 60 ]; then
+      if mailbox_register_key && mailbox_load_binding; then
+        _binding_retry=0
+      else
+        MAILBOX_URL=""
+        sleep "$MAILBOX_POLL_INTERVAL"
+        continue
+      fi
+    fi
+    _binding_retry=$((_binding_retry + 1))
+    _file="$MAILBOX_STATE_DIR/request.json"
+    mailbox_raw_get "$MAILBOX_URL" "$_file"; _get_rc=$?
+    if [ "$_get_rc" -eq 44 ]; then
+      rm -f "$_file"; sleep "$MAILBOX_POLL_INTERVAL"; continue
+    elif [ "$_get_rc" -ne 0 ]; then
+      rm -f "$_file"; mailbox_log "mailbox fetch unavailable rc=$_get_rc"; sleep "$MAILBOX_POLL_INTERVAL"; continue
+    fi
+    _source_sha="$(sha256sum "$_file" | awk '{print $1}')"
+    if ! hex64 "$_source_sha"; then rm -f "$_file"; sleep "$MAILBOX_POLL_INTERVAL"; continue; fi
+    if [ "$(mailbox_last_source)" = "$_source_sha" ]; then rm -f "$_file"; sleep "$MAILBOX_POLL_INTERVAL"; continue; fi
+    mailbox_process_file "$_file" "$_source_sha"; _process_rc=$?; rm -f "$_file"
+    case "$_process_rc" in
+      0|2|3) mailbox_durable_line "$MAILBOX_LAST_SOURCE_FILE" "$_source_sha" || true ;;
+      1) mailbox_log "mailbox request not accepted source=$_source_sha" ;;
+    esac
+    sleep "$MAILBOX_POLL_INTERVAL"
+  done
+}
+
+child_pid=""
+mailbox_pid=""
+
+terminate_pid() {
+  _pid="$1"
+  case "$_pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_pid" -gt 1 ] 2>/dev/null || return 0
+  kill -TERM "$_pid" 2>/dev/null || true
+  _i=0
+  while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 10 ]; do sleep 1; _i=$((_i+1)); done
+  kill -KILL "$_pid" 2>/dev/null || true
+  wait "$_pid" 2>/dev/null || true
+}
+
+start_mailbox() {
+  mailbox_loop &
+  mailbox_pid=$!
+  log "github mailbox transport started pid=$mailbox_pid"
+}
+
+shutdown() {
+  status stopping signal "${child_pid:-none}" "${mailbox_pid:-none}"
+  terminate_pid "${mailbox_pid:-}"
+  terminate_pid "${child_pid:-}"
+  mailbox_pid=""; child_pid=""
+  rm -f "$PID_FILE" 2>/dev/null || true
+  status stopped signal none none
+  exit 0
+}
+trap shutdown TERM INT HUP
+
+status waiting configuration none none
+log "supervisor started pid=$$"
+while :; do
+  load_configuration
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    status waiting "configuration_$_rc" none none
+    sleep "$RESTART_DELAY"
+    continue
+  fi
+
+  status starting configured none none
+  start_mailbox
+  "$AGENT" >>"$LOG_FILE" 2>&1 &
+  child_pid=$!
+  status running agent_started "$child_pid" "$mailbox_pid"
+  log "agent started pid=$child_pid"
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if ! kill -0 "$mailbox_pid" 2>/dev/null; then
+      wait "$mailbox_pid" 2>/dev/null || true
+      mailbox_pid=""
+      start_mailbox
+      status running mailbox_restarted "$child_pid" "$mailbox_pid"
+    fi
+    sleep 5
+  done
