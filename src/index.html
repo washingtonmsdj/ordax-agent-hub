@@ -9,11 +9,14 @@
 </head>
 <body>
   <header class="topbar">
-    <div>
+    <div class="brand-row">
       <strong>OrdaX Agent Hub</strong>
+      <span id="appVersion" class="version-pill">v…</span>
       <span class="muted">multi-account GPT workspace</span>
     </div>
     <div class="top-actions">
+      <span id="updateStatus" class="muted tiny"></span>
+      <button id="checkUpdateBtn" class="ghost">Atualizações</button>
       <button id="refreshAllBtn" class="ghost">Atualizar Git</button>
       <button id="addAgentBtn" class="primary">+ Agente</button>
     </div>
@@ -52,26 +55,44 @@
 
       <section class="card">
         <div class="card-title-row">
-          <h3>Repositório local</h3>
+          <div>
+            <h3>Workspace Git</h3>
+            <div class="muted tiny">Clone ou worktree usado somente para contexto local</div>
+          </div>
           <button id="refreshGitBtn" class="icon-btn" title="Atualizar">↻</button>
         </div>
+
         <div class="repo-path-row">
-          <input id="repoPath" readonly placeholder="Selecione o clone local..." />
-          <button id="pickRepoBtn">...</button>
+          <input id="repoPath" readonly placeholder="Selecione um checkout/worktree Git..." />
+          <button id="pickRepoBtn" title="Selecionar workspace">...</button>
         </div>
-        <div class="git-grid">
+
+        <div class="workspace-status-row">
+          <span id="workspaceBadge" class="workspace-badge neutral">SEM WORKSPACE</span>
+        </div>
+
+        <div class="git-grid git-grid-detailed">
+          <span>Projeto</span><strong id="gitProject">—</strong>
+          <span>Tipo</span><strong id="gitWorkspaceType">—</strong>
+          <span>Root Git</span><strong id="gitRoot" class="mono path-value">—</strong>
           <span>Branch</span><strong id="gitBranch" class="mono">—</strong>
           <span>Esperada</span><strong id="expectedBranch" class="mono">—</strong>
           <span>HEAD</span><strong id="gitHead" class="mono">—</strong>
+          <span>Remote</span><strong id="gitRemote" class="mono path-value">—</strong>
           <span>Status</span><strong id="gitStatus">—</strong>
         </div>
+
+        <div id="repoNotice" class="notice hidden"></div>
         <div id="branchWarning" class="warning hidden"></div>
+
         <div class="button-row">
           <button id="openFolderBtn">Abrir pasta</button>
+          <button id="openRemoteBtn">Abrir GitHub</button>
           <button id="copyContextBtn">Copiar contexto</button>
         </div>
+
         <div class="changes-wrap">
-          <div class="muted tiny">Mudanças locais (somente leitura)</div>
+          <div class="muted tiny">Mudanças locais (somente leitura — o Agent Hub não faz commit/push)</div>
           <pre id="gitChanges" class="changes">—</pre>
         </div>
       </section>
@@ -81,13 +102,12 @@
         <textarea id="mission" placeholder="O que este agente deve fazer?"></textarea>
         <div class="button-row">
           <button id="saveMissionBtn" class="primary">Salvar missão</button>
-          <button id="openPrBtn">Abrir remoto</button>
         </div>
       </section>
 
       <section class="card memory-card">
-        <div><strong>Economia de memória</strong></div>
-        <div class="muted tiny">Abas inativas são descarregadas após <span id="suspendMinutesLabel"></span> min. A sessão/cookies permanecem no perfil.</div>
+        <div><strong>Persistência & memória</strong></div>
+        <div class="muted tiny">Configurações possuem backup local. Abas inativas são descarregadas após <span id="suspendMinutesLabel"></span> min; cookies/sessões permanecem no perfil isolado.</div>
       </section>
     </aside>
   </main>
@@ -109,6 +129,7 @@
     </div>
   </div>
 
+  <script src="workspace.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

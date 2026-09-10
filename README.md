@@ -1,73 +1,49 @@
-# OrdaX Agent Hub — v0.1.0-dev
+# OrdaX Agent Hub — v0.2.0-dev
 
-Aplicativo desktop local para organizar várias sessões **manuais** do ChatGPT em abas isoladas e associar cada aba a uma missão, branch e clone Git local.
+Desktop workspace for keeping multiple manual ChatGPT sessions isolated while associating each session with a clearly identified Git workspace, expected branch and mission.
 
-## O que esta versão faz
+## Windows installation
 
-- uma aba por agente/conta;
-- cada aba usa um `partition` persistente do Electron, separando cookies e sessão;
-- login é feito manualmente pelo usuário dentro de cada aba;
-- quatro agentes iniciais: Foundation, App Platform, Core Apps e QA / Tools;
-- permite adicionar/editar/excluir abas;
-- associa cada agente a um clone Git local;
-- lê branch, HEAD e `git status` sem alterar o repositório;
-- avisa se a branch atual não é a branch esperada pelo agente;
-- botão **Copiar contexto** monta um pequeno cabeçalho para colar na conversa;
-- mantém a última URL/conversa visitada por aba;
-- descarrega WebViews inativas após 10 minutos para reduzir uso de memória, preservando cookies/sessão persistente;
-- gera instalador NSIS e versão portátil para Windows via `electron-builder`.
+Approved builds are intended to be distributed through GitHub Releases:
 
-## O que esta versão NÃO faz
+1. open **Releases**;
+2. download `OrdaX-Agent-Hub-Setup-<version>-x64.exe`;
+3. run the installer;
+4. open **OrdaX Agent Hub** from the Start Menu or desktop shortcut.
 
-- não conhece nem salva sua senha do Google/OpenAI;
-- não extrai tokens/cookies;
-- não automatiza envio de prompts nem leitura de respostas;
-- não alterna automaticamente contas para contornar limites de uso;
-- não executa commits/push/merge;
-- não modifica o repositório Git;
-- não dá ao ChatGPT web acesso direto ao filesystem local.
+A portable build named `OrdaX-Agent-Hub-Portable-<version>-x64.exe` is also generated. Pull Requests produce test artifacts through the **Windows Build** workflow; GitHub Releases remain the approved distribution source.
 
-O painel Git é uma ferramenta local separada da sessão web.
+## What v0.2 changes
 
-## Requisitos no Windows
+The Agent Hub now treats a Git *workspace* as the root of a clone or linked worktree, not as an arbitrary folder.
 
-1. Node.js LTS instalado.
-2. Git instalado e disponível no `PATH`.
-3. Internet.
+- selecting a normal subdirectory is automatically normalized to its Git root;
+- selecting a folder outside Git is rejected;
+- linked worktrees are detected and labeled `WORKTREE ISOLADO`;
+- primary checkouts are labeled separately;
+- the panel shows project, root, remote, branch, expected branch, HEAD and local changes;
+- if two tabs resolve to the same Git root, the app warns that the workspace is shared;
+- if an expected branch differs while the shared checkout is dirty, the app explicitly tells the user not to switch branches and to use a separate worktree.
 
-## Rodar em modo desenvolvimento
+The Git panel remains **read-only**. The application does not create branches, commit, push, merge, discard changes or create worktrees.
 
-Abra `PowerShell` nesta pasta:
+## Multi-agent layout
 
-```powershell
-npm install
-npm start
+Recommended local structure:
+
+```text
+ordax-workspaces/
+├── foundation/      -> codex/foundation-vnext
+├── app-platform/    -> agent/app-platform
+├── core-apps/       -> agent/core-apps
+└── qa-tools/        -> agent/qa-tools
 ```
 
-Ou execute `run-windows.bat`.
+They may all belong to the same `novo-ordax-os` monorepo, while each working directory is a separate Git worktree. This isolates uncommitted changes without splitting the product into multiple repositories.
 
-## Criar .exe / instalador
+## Sessions and data persistence
 
-```powershell
-npm install
-npm run dist:win
-```
-
-Ou execute `build-windows.bat`.
-
-Os arquivos gerados ficam normalmente em `dist/`.
-
-## Primeiro uso
-
-1. Abra o app.
-2. Clique na aba `Foundation`.
-3. Faça login na Conta GPT 1 normalmente dentro da aba.
-4. Abra `App Platform` e faça login com a Conta GPT 2.
-5. Repita nas demais abas.
-6. Em cada aba, clique em `...` ao lado de **Repositório local** e selecione o clone/worktree correspondente.
-7. Defina a branch esperada e missão pelo botão de edição.
-
-Cada aba recebe um perfil persistente diferente, por exemplo:
+Each agent keeps a stable Electron partition, for example:
 
 ```text
 persist:ordax-agent-foundation
@@ -76,28 +52,49 @@ persist:ordax-agent-core-apps
 persist:ordax-agent-qa-tools
 ```
 
-## Observação sobre login
+Version 0.2 keeps those IDs unchanged. Agent configuration is stored under Electron `userData`, now using schema `version: 2`. Before replacing state, the application keeps `agents.json.bak`; if the primary state becomes unreadable, it attempts recovery from the backup.
 
-O ChatGPT e provedores de identidade podem alterar políticas de login em navegadores embutidos. Login por Google/OAuth pode eventualmente exigir abrir um navegador externo ou uma implementação futura baseada em Chromium/CEF com tratamento específico. O MVP não tenta contornar restrições do provedor.
+Updating the application binary normally does not remove these user-data directories or session partitions.
 
-## Segurança
+## Update experience
 
-O renderer principal usa `contextIsolation`, `sandbox` e uma API IPC mínima. Os WebViews do ChatGPT têm Node desativado. Mesmo assim, trate esta versão como MVP de desenvolvimento, não como um navegador de uso geral.
+The app now has an **Atualizações** control. It checks non-draft releases from `washingtonmsdj/ordax-agent-hub` and, if a newer version exists, offers the approved GitHub Release page.
 
-## Próximas versões sugeridas
+This is intentionally a safe first step: v0.2 does **not** silently replace the running executable. Fully automatic download/restart will only be enabled after release signing and rollback behavior are defined.
 
-- V0.2: painel de PRs, diff viewer, testes e worktrees;
-- V0.3: handoff entre agentes e dependências;
-- V0.4: integração opcional com Codex local para testes/integração final;
-- migração de `<webview>` para uma arquitetura de views Chromium controladas pelo processo principal caso seja necessário maior isolamento/controle.
+## ChatGPT behavior
 
+- login is manual;
+- accounts/sessions remain isolated by Electron partition;
+- the app does not know or save Google/OpenAI passwords;
+- it does not extract tokens/cookies;
+- it does not automate prompt sending or response scraping;
+- it does not rotate accounts automatically to bypass service limits.
 
-## Desenvolvimento via Git
+## Memory management
 
-Este projeto foi separado do repositório do OrdaX OS. O fluxo recomendado é:
+Inactive webviews are unloaded after the configured interval (10 minutes by default). Their persistent session partition remains available when the tab is opened again.
 
-```text
-branch -> commit -> push -> pull request -> CI -> revisão -> merge
+## Development
+
+Requirements: Node.js LTS, Git and Internet.
+
+```powershell
+npm install
+npm start
 ```
 
-A versão inicial de desenvolvimento é `v0.1.0-dev`. Atualização automática do aplicativo não faz parte desta versão; ela será adicionada somente depois que a base do Agent Hub estiver estável.
+Build Windows installer + portable:
+
+```powershell
+npm install
+npm run dist:win
+```
+
+## CI / Release
+
+- `.github/workflows/ci.yml` validates JavaScript and package metadata;
+- `.github/workflows/windows-build.yml` builds and verifies Setup + Portable on Windows and emits `SHA256SUMS.txt`;
+- `.github/workflows/release-windows.yml` requires the Git tag to match the `package.json` version before publishing a Release.
+
+The application is still unsigned during development, so Windows SmartScreen may show an unknown-publisher warning.

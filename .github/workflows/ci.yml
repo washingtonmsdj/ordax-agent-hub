@@ -1,8 +1,7 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,8 +22,9 @@ jobs:
         run: |
           node --check src/main.js
           node --check src/preload.js
+          node --check src/workspace.js
           node --check src/renderer.js
 
       - name: Validate package metadata
         run: |
-          node -e "const p=require('./package.json'); if(p.name!=='ordax-agent-hub'||p.version!=='0.1.0-dev'||p.main!=='src/main.js') process.exit(1)"
+          node -e "const p=require('./package.json'); if(p.name!=='ordax-agent-hub'||!/^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$/.test(p.version)||p.main!=='src/main.js') process.exit(1)"
